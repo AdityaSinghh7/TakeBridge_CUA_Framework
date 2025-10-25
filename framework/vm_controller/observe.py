@@ -292,6 +292,9 @@ class VMObserver:
         *,
         include_screenshot: bool = True,
         encode_screenshot: bool = True,
+        downsample: bool = False,
+        max_width: int = 1280,
+        max_height: int = 720,
     ) -> ObservationSnapshot:
         """
         Collect a best-effort snapshot of the VM state.
@@ -328,7 +331,9 @@ class VMObserver:
             try:
                 path, encoded = self.capture_screenshot(
                     encode_base64=encode_screenshot,
-                    downscale=False,
+                    downscale=downsample,
+                    max_width=max_width,
+                    max_height=max_height,
                 )
                 snapshot.screenshot_path = path
                 snapshot.screenshot_b64 = encoded

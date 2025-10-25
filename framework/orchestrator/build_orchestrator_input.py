@@ -8,7 +8,8 @@ that persist across orchestrator runs.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 from framework.orchestrator.data_types import OrchestratorInput
 from framework.utils.logger import StructuredLogger
@@ -120,9 +121,9 @@ class OrchestratorInputBuilder:
         initial_task: str,
         max_steps: int,
         model_name: str,
-        current_state_image: str,
+        current_state_image: Optional[str],
         current_state_notes: Optional[Dict[str, str]] = None,
-    ) -> OrchestratorInput:
+    ) -> Tuple[OrchestratorInput, str]:
         """
         Construct the first `OrchestratorInput` for a new orchestrator run.
         """
@@ -130,7 +131,7 @@ class OrchestratorInputBuilder:
             initial_task=initial_task,
             current_progress=self.rolling_progress or {},
             current_state_notes=current_state_notes or self.rolling_state_notes or {},
-            current_state_image=current_state_image,
+            current_state_image=current_state_image or "",
             last_step_telemetry=self.rolling_last_step_telemetry or {},
         )
         self.logger.info("Building initial orchestrator input with prompt template.")
@@ -148,11 +149,11 @@ class OrchestratorInputBuilder:
             model_name=model_name,
             progress=self.rolling_progress,
             last_step_telemetry=self.rolling_last_step_telemetry,
-            image_input=current_state_image,
+            image_input=current_state_image if current_state_image else None,
             current_state_notes=current_state_notes or self.rolling_state_notes,
         )
         self.logger.info("Initial orchestrator input constructed successfully.")
-        return orchestrator_input
+        return orchestrator_input, prompt
 
     def update_context(
         self,
@@ -185,4 +186,35 @@ class OrchestratorInputBuilder:
         self.rolling_last_step_telemetry = None
 
 
-__all__ = ["OrchestratorInputBuilder", "START_USER_PROMPT"]
+def snapshot_to_state_notes(snapshot: Any) -> Dict[str, str]:
+    """
+    Convert an ObservationSnapshot into orchestrator-friendly state notes.
+    """
+    notes: Dict[str, str] = {}
+    if snapshot is None:
+        return notes
+
+    platform = getattr(snapshot, "platform", None)
+    if platform:
+        notes["platform"] = str(platform)
+
+    clipboard = getattr(snapshot, "clipboard", None)
+    if clipboard:
+        notes["clipboard"] = clipboard
+
+    active_window = getattr(snapshot, "active_window", None)
+    if active_window:
+        notes["active_window"] = active_window
+
+    active_application = getattr(snapshot, "active_application", None)
+    if active_application:
+        notes["active_application"] = active_application
+
+    active_url = getattr(snapshot, "active_url", None)
+    if active_url:
+        notes["active_url"] = active_url
+
+    return notes
+
+
+__all__ = ["OrchestratorInputBuilder", "START_USER_PROMPT", "snapshot_to_state_notes"]
