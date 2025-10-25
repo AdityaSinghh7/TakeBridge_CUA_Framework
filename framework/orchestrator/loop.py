@@ -136,15 +136,10 @@ class OrchestratorLoop:
                 self._logger.info("continue_or_start tool invoked; delegating to worker agent stub.")
                 self._handle_continue_or_start(arguments)
             else:
-                self._logger.info(f"Unhandled tool '{tool_name}'; exiting loop.")
-                break
+                error_message = f"Unhandled tool '{tool_name}' received from orchestrator LLM."
+                self._logger.info(error_message)
+                raise RuntimeError(error_message)
 
-        function_call_payload = {"action": "noop", "metadata": {"step": 1}}
-        output = {"status": "not_implemented"}
-        return OrchestratorOutput(
-            function_call_payload=function_call_payload,
-            output=output,
-        )
     def _extract_function_call(self, response: Response) -> Optional[Dict[str, Any]]:
         for item in getattr(response, "output", []) or []:
             if item.get("type") == "function_call":
@@ -159,6 +154,10 @@ class OrchestratorLoop:
         self._logger.info_lines(
             "continue_or_start payload:",
             [f"{key}: {value}" for key, value in arguments.items()],
+        )
+        return OrchestratorOutput(
+            function_call_payload={"tool": "continue_or_start", "arguments": arguments},
+            output={"status": "not_implemented"},
         )
 
 
