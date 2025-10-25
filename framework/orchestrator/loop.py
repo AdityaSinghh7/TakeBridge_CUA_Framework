@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Optional, Tuple, List, Dict, Any
 
-from framework.api.oai_client import OAIClient, ResponseSession
+from framework.api.oai_client import OAIClient, ResponseSession, Response
 from framework.orchestrator.build_orchestrator_input import (
     OrchestratorInputBuilder,
     snapshot_to_state_notes,
@@ -102,14 +102,63 @@ class OrchestratorLoop:
                 infeasible_tool(),
             ]
             self._logger.info("Prepared messages and tool payload for orchestrator LLM call.")
-            # TODO: integrate observation, prompt construction, LLM calls, tool execution.
-            break  # Placeholder: exit after first iteration until logic is implemented.
+            response = self._oai_client.respond_with_session(
+                self._session,
+                messages=messages,
+                tools=tools_payload,
+                max_output_tokens=4092 * 3,
+                reasoning_effort="medium",
+                reasoning_summary="auto",
+            )
+            function_call = self._extract_function_call(response)
+            if function_call is None:
+                self._logger.info("No function call returned; terminating orchestrator loop.")
+                break
+
+            tool_name = function_call.get("name")
+            arguments = function_call.get("arguments") or {}
+            self._logger.info(f"Received tool call: {tool_name}")
+
+            if tool_name == "finish":
+                self._logger.info("Finish tool invoked; concluding orchestration.")
+                return OrchestratorOutput(
+                    function_call_payload={"tool": tool_name, "arguments": arguments},
+                    output={"status": "finished", "completion_rationale": arguments.get("completion_rationale")},
+                )
+            if tool_name == "infeasible":
+                self._logger.info("Infeasible tool invoked; concluding orchestration.")
+                return OrchestratorOutput(
+                    function_call_payload={"tool": tool_name, "arguments": arguments},
+                    output={"status": "infeasible", "details": arguments},
+                )
+
+            if tool_name == "continue_or_start":
+                self._logger.info("continue_or_start tool invoked; delegating to worker agent stub.")
+                self._handle_continue_or_start(arguments)
+            else:
+                self._logger.info(f"Unhandled tool '{tool_name}'; exiting loop.")
+                break
 
         function_call_payload = {"action": "noop", "metadata": {"step": 1}}
         output = {"status": "not_implemented"}
         return OrchestratorOutput(
             function_call_payload=function_call_payload,
             output=output,
+        )
+    def _extract_function_call(self, response: Response) -> Optional[Dict[str, Any]]:
+        for item in getattr(response, "output", []) or []:
+            if item.get("type") == "function_call":
+                return {
+                    "name": item.get("name"),
+                    "arguments": item.get("arguments"),
+                }
+        return None
+
+    def _handle_continue_or_start(self, arguments: Dict[str, Any]) -> None:
+        self._logger.info("Worker agent execution stub: continue_or_start arguments received.")
+        self._logger.info_lines(
+            "continue_or_start payload:",
+            [f"{key}: {value}" for key, value in arguments.items()],
         )
 
 
