@@ -14,10 +14,12 @@ Requires: openai>=1.0.0
 from __future__ import annotations
 
 import os
+import random
+import time
 from functools import lru_cache
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Union
 
 try:
     # Optional dependency; we won't hard-require it
@@ -27,6 +29,20 @@ except Exception:  # pragma: no cover
     find_dotenv = None
 
 from openai import OpenAI
+try:
+    from openai import (
+        APIConnectionError,
+        APIError,
+        APITimeoutError,
+        APIStatusError,
+        RateLimitError,
+    )
+except Exception:  # pragma: no cover
+    try:
+        from openai.error import OpenAIError as APIError  # type: ignore
+    except Exception:  # pragma: no cover
+        APIError = Exception  # type: ignore[assignment]
+    APIConnectionError = APITimeoutError = APIStatusError = RateLimitError = Exception  # type: ignore[assignment]
 from openai.types.responses import Response
 
 Message = Dict[str, Any]
@@ -35,6 +51,47 @@ Tool = Dict[str, Any]
 
 ReasoningEffort = Literal["low", "medium", "high"]
 ReasoningSummary = Optional[Literal["auto", "concise", "detailed"]]
+
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_BACKOFF_BASE_SECONDS = 0.5
+DEFAULT_BACKOFF_CAP_SECONDS = 8.0
+DEFAULT_BACKOFF_JITTER_SECONDS = 0.25
+_RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """
+    Determine if the exception returned by the OpenAI client is retryable.
+    Conservatively matches connection/timeouts + known transient status codes.
+    """
+    if isinstance(
+        exc,
+        (
+            APIConnectionError,
+            APITimeoutError,
+            RateLimitError,
+        ),
+    ):
+        return True
+    if isinstance(exc, APIStatusError):
+        status_code = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+        if isinstance(status_code, int) and status_code in _RETRYABLE_STATUS_CODES:
+            return True
+    if isinstance(exc, APIError):
+        status_code = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+        if isinstance(status_code, int) and status_code in _RETRYABLE_STATUS_CODES:
+            return True
+        # Some APIError instances expose error.type (string) describing the failure kind.
+        error_type = getattr(exc, "type", None)
+        if isinstance(error_type, str) and any(
+            keyword in error_type
+            for keyword in ("timeout", "server_error", "connection_error")
+        ):
+            return True
+    # Fallback: treat built-in transient network issues as retryable.
+    if isinstance(exc, (TimeoutError, ConnectionError)):  # type: ignore[arg-type]
+        return True
+    return False
 
 
 def _normalize_messages(messages: Iterable[Message]) -> List[Message]:
@@ -120,6 +177,10 @@ class OAIClient:
         timeout: Optional[float] = None,
         base_url: Optional[str] = None,  # allow Azure/OpenRouter/self-hosted gateways
         default_tools: Optional[List[Tool]] = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        retry_backoff_base: float = DEFAULT_BACKOFF_BASE_SECONDS,
+        retry_backoff_cap: float = DEFAULT_BACKOFF_CAP_SECONDS,
+        retry_backoff_jitter: float = DEFAULT_BACKOFF_JITTER_SECONDS,
     ) -> None:
         if api_key is None:
             # Load OPENAI_API_KEY from env (optionally preloaded via respond_once)
@@ -133,6 +194,12 @@ class OAIClient:
         self._default_reasoning_effort = default_reasoning_effort
         self._default_reasoning_summary = default_reasoning_summary
         self._default_tools = default_tools or []
+        self._max_retries = max(0, int(max_retries))
+        base = max(0.0, float(retry_backoff_base))
+        cap = max(base, float(retry_backoff_cap))
+        self._retry_backoff_base = base
+        self._retry_backoff_cap = cap
+        self._retry_backoff_jitter = max(0.0, float(retry_backoff_jitter))
 
     @property
     def default_model(self) -> str:
@@ -156,6 +223,11 @@ class OAIClient:
         reasoning_summary: ReasoningSummary = None,
         # Carry-forward reasoning + tool items
         carry_items: Optional[List[InputItem]] = None,
+        # Retry controls
+        max_retries: Optional[int] = None,
+        retry_backoff_base: Optional[float] = None,
+        retry_backoff_cap: Optional[float] = None,
+        retry_backoff_jitter: Optional[float] = None,
         # Any other passthrough args (e.g., temperature, stop, metadata, store, ...)
         **kwargs: Any,
     ) -> Response:
@@ -178,6 +250,10 @@ class OAIClient:
             reasoning_effort: "low" | "medium" | "high" (default "medium").
             reasoning_summary: "auto" | "concise" | "detailed" | None. If None, omitted.
             carry_items: items to prepend (reasoning/tool/function items from prior turn).
+            max_retries: number of retry attempts for retryable errors (defaults to client config).
+            retry_backoff_base: starting backoff delay in seconds (defaults to client config).
+            retry_backoff_cap: maximum backoff delay in seconds (defaults to client config).
+            retry_backoff_jitter: random jitter (0..value) in seconds added to backoff (defaults to client config).
             **kwargs: forwarded to `client.responses.create(...)`.
 
         Returns:
@@ -246,7 +322,40 @@ class OAIClient:
         # Any passthrough params (temperature, stop, metadata, store, etc.)
         payload.update(kwargs)
 
-        return self._client.responses.create(**payload)
+        resolved_max_retries = (
+            self._max_retries if max_retries is None else max(0, int(max_retries))
+        )
+        resolved_backoff_base = (
+            self._retry_backoff_base
+            if retry_backoff_base is None
+            else max(0.0, float(retry_backoff_base))
+        )
+        resolved_backoff_cap = (
+            self._retry_backoff_cap
+            if retry_backoff_cap is None
+            else max(resolved_backoff_base, float(retry_backoff_cap))
+        )
+        resolved_backoff_jitter = (
+            self._retry_backoff_jitter
+            if retry_backoff_jitter is None
+            else max(0.0, float(retry_backoff_jitter))
+        )
+
+        attempt = 0
+        while True:
+            try:
+                return self._client.responses.create(**payload)
+            except Exception as exc:
+                if not _is_retryable_error(exc) or attempt >= resolved_max_retries:
+                    raise
+                backoff_seconds = min(
+                    resolved_backoff_cap,
+                    resolved_backoff_base * (2**attempt),
+                )
+                if resolved_backoff_jitter:
+                    backoff_seconds += random.uniform(0.0, resolved_backoff_jitter)
+                time.sleep(backoff_seconds)
+                attempt += 1
 
     # ---------- High-level conveniences ----------
 
@@ -343,6 +452,11 @@ def respond_once(
     dotenv_path: Optional[str] = None,  # load OPENAI_API_KEY from this .env (or auto-find)
     timeout: Optional[float] = None,
     base_url: Optional[str] = None,
+    # Retry controls
+    max_retries: Optional[int] = None,
+    retry_backoff_base: Optional[float] = None,
+    retry_backoff_cap: Optional[float] = None,
+    retry_backoff_jitter: Optional[float] = None,
     # Any passthrough (temperature, stop, metadata, store, ...)
     **kwargs: Any,
 ) -> Response:
@@ -351,6 +465,7 @@ def respond_once(
       - Loads OPENAI_API_KEY from .env (if available) → env → SDK default.
       - Reuses a cached OpenAI client under the hood.
       - No ResponseSession required.
+      - Applies exponential backoff retries for transient failures (configurable).
 
     Returns:
         openai.types.responses.Response
@@ -379,5 +494,9 @@ def respond_once(
         previous_response_id=previous_response_id,
         reasoning_effort=reasoning_effort,
         reasoning_summary=reasoning_summary,
+        max_retries=max_retries,
+        retry_backoff_base=retry_backoff_base,
+        retry_backoff_cap=retry_backoff_cap,
+        retry_backoff_jitter=retry_backoff_jitter,
         **kwargs,
     )
