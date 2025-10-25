@@ -8,7 +8,6 @@ constructing user-facing payloads.
 
 from __future__ import annotations
 
-import base64
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -16,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
 from framework.api.controller_client import VMControllerClient, VMControllerError
+from framework.utils.image_processor import ImageProcessor, downscale_image_bytes
 
 
 def _parse_active_context_from_at(at_xml: str) -> Dict[str, Any]:
@@ -187,8 +187,11 @@ class VMObserver:
         *,
         screenshot_dir: Optional[Union[str, Path]] = None,
         client_kwargs: Optional[Dict[str, Any]] = None,
+        image_processor: Optional[ImageProcessor] = None,
     ) -> None:
         self._client = client or VMControllerClient(**(client_kwargs or {}))
+        self._image_processor = image_processor or ImageProcessor()
+        self._latest_screenshot_hash: Optional[int] = None
         if screenshot_dir:
             target = Path(screenshot_dir).expanduser()
             target.mkdir(parents=True, exist_ok=True)
@@ -205,18 +208,28 @@ class VMObserver:
         *,
         filename: Optional[str] = None,
         encode_base64: bool = True,
+        downscale: bool = False,
+        max_width: int = 1280,
+        max_height: int = 720,
     ) -> Tuple[Path, Optional[str]]:
         """
         Capture a screenshot and persist it locally. Returns the path and optional base64 string.
         """
         snapshot_bytes = self._client.capture_screenshot()
+        self._latest_screenshot_hash = None
+        if downscale:
+            snapshot_bytes = downscale_image_bytes(
+                snapshot_bytes, max_w=max_width, max_h=max_height
+            )
         filename = filename or f"vm_screenshot_{int(time.time() * 1000)}.png"
         destination = self._screenshot_dir / filename
         destination.write_bytes(snapshot_bytes)
 
         b64_value = None
         if encode_base64:
-            b64_value = base64.b64encode(snapshot_bytes).decode("ascii")
+            b64_value = self._image_processor.encode_image(snapshot_bytes)
+            snapshot_hash = self._image_processor.dhash(snapshot_bytes)
+            self._latest_screenshot_hash = snapshot_hash
         return destination, b64_value
 
     def clipboard(self) -> Optional[str]:
@@ -313,9 +326,14 @@ class VMObserver:
 
         if include_screenshot:
             try:
-                path, encoded = self.capture_screenshot(encode_base64=encode_screenshot)
+                path, encoded = self.capture_screenshot(
+                    encode_base64=encode_screenshot,
+                    downscale=False,
+                )
                 snapshot.screenshot_path = path
                 snapshot.screenshot_b64 = encoded
+                if encoded and self._latest_screenshot_hash is not None:
+                    snapshot.raw_metadata["screenshot_hash"] = self._latest_screenshot_hash
             except VMControllerError as exc:
                 snapshot.raw_metadata["screenshot_error"] = str(exc)
 
